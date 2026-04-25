@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-agent.py — OpenRouter agent with tool-calling loop.
-Imports tool definitions and implementations from tools.py.
+agent.py — OpenRouter agent with tool-calling loop + EventBus.
+
+Events fired each turn
+-----------------------
+  PreToolUse   → before a tool runs  (handler may cancel it)
+  PostToolUse  → after  a tool runs  (carries the result)
+  Stop         → when the loop exits (reason + final reply)
 
 Usage:
     export OPENROUTER_API_KEY=sk-or-...
     python agent.py
+
+Set AGENT_AUTO_APPROVE=1 to skip interactive approval prompts.
 """
 
 import json
@@ -13,20 +20,21 @@ import os
 import urllib.request
 import urllib.error
 
-from tools import TOOL_DEFINITIONS, execute_tool
+from tools  import TOOL_DEFINITIONS, execute_tool
+from events import bus, PreToolUse, PostToolUse, Stop
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
-API_KEY = "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"
+API_KEY = "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"
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL    = "openai/gpt-4o-mini"   # swap to any OpenRouter model that supports tools
+MODEL    = "openai/gpt-4o-mini"
 SYSTEM   = (
     "You are a helpful coding agent. "
     "Use the provided tools whenever you need to read/write files, "
     "run commands, or search the filesystem. "
     "Always reason step-by-step before acting."
 )
-MAX_TOOL_ROUNDS = 10   # safety limit — stops infinite tool loops
+MAX_TOOL_ROUNDS = 10
 # ─────────────────────────────────────────────────────────────────────────────
 
 COLORS = {
@@ -46,19 +54,10 @@ def c(color: str, text: str) -> str:
 # ── API call ──────────────────────────────────────────────────────────────────
 
 def call_api(messages: list[dict]) -> dict:
-    """Send messages + tools to OpenRouter. Returns the raw response dict."""
-
-        # Print messages before API call
-    print("\n=== Messages being sent ===")
-    print(json.dumps(messages, indent=2, ensure_ascii=False))
-    print("===========================\n")
-
-
-
     payload = json.dumps({
-        "model":    MODEL,
-        "messages": messages,
-        "tools":    TOOL_DEFINITIONS,
+        "model":       MODEL,
+        "messages":    messages,
+        "tools":       TOOL_DEFINITIONS,
         "tool_choice": "auto",
     }).encode()
 
@@ -82,51 +81,107 @@ def call_api(messages: list[dict]) -> dict:
 
 def run_agent(history: list[dict]) -> str:
     """
-    Run the agent loop for the current turn.
-    Keeps calling the model and executing tools until finish_reason == 'stop'.
-    Returns the final assistant text.
+    Agentic loop: call model → handle tool calls → repeat until stop.
+
+    Events emitted
+    --------------
+    PreToolUse   before each tool call  (cancellable)
+    PostToolUse  after  each tool call
+    Stop         when the loop exits
     """
-    for round_num in range(MAX_TOOL_ROUNDS):
+
+    for _round in range(MAX_TOOL_ROUNDS):
+
+        # ── 1. Call the model ─────────────────────────────────────────────
         try:
             response = call_api(history)
         except urllib.error.HTTPError as e:
-            body = e.read().decode()
-            return f"[HTTP {e.code}] {body}"
+            error_body = e.read().decode()
+            error_msg  = f"[HTTP {e.code}] {error_body}"
+            bus.emit(Stop(reason="error", final_reply="", error=error_msg))
+            return error_msg
 
         choice  = response["choices"][0]
         message = choice["message"]
         reason  = choice.get("finish_reason", "stop")
 
-        # Always add the raw assistant message to history
         history.append(message)
 
-        # ── No tool calls → we're done ────────────────────────────────────
+        # ── 2. No tool calls → natural stop ──────────────────────────────
         if reason == "stop" or not message.get("tool_calls"):
-            return message.get("content") or ""
+            final = message.get("content") or ""
+            bus.emit(Stop(reason="stop", final_reply=final))
+            return final
 
-        # ── Execute every tool call the model requested ───────────────────
+        # ── 3. Process each tool call ─────────────────────────────────────
         for tool_call in message["tool_calls"]:
-            fn_name = tool_call["function"]["name"]
+            fn_name      = tool_call["function"]["name"]
+            tool_call_id = tool_call["id"]
+
             try:
                 args = json.loads(tool_call["function"]["arguments"])
             except json.JSONDecodeError:
                 args = {}
 
-            print(c("yellow", f"\n  ⚙  {fn_name}"), c("dim", json.dumps(args)))
+            # ── PreToolUse ────────────────────────────────────────────────
+            pre = bus.emit(PreToolUse(
+                tool_name    = fn_name,
+                tool_call_id = tool_call_id,
+                arguments    = args,
+            ))
 
-            result = execute_tool(fn_name, args)
+            if pre.cancelled:
+                result = f"[Cancelled] {pre.cancel_reason}"
+                print(c("red", f"  ✗ {fn_name} cancelled: {pre.cancel_reason}"))
+            else:
+                # ── Execute ───────────────────────────────────────────────
+                print(c("yellow", f"\n  ⚙  {fn_name}"), c("dim", json.dumps(args)))
+                result = execute_tool(fn_name, args)
+                preview = result[:200] + ("…" if len(result) > 200 else "")
+                print(c("dim", f"     → {preview}"))
 
-            print(c("dim", f"     → {result[:200]}{'…' if len(result) > 200 else ''}"))
+            # ── PostToolUse ───────────────────────────────────────────────
+            bus.emit(PostToolUse(
+                tool_name    = fn_name,
+                tool_call_id = tool_call_id,
+                arguments    = args,
+                result       = result,
+            ))
 
-            # Append the tool result so the model can read it next round
+            # Feed result back into history for the next model call
             history.append({
                 "role":         "tool",
-                "tool_call_id": tool_call["id"],
+                "tool_call_id": tool_call_id,
                 "name":         fn_name,
                 "content":      result,
             })
 
-    return "[max tool rounds reached]"
+    # ── Hit round limit ───────────────────────────────────────────────────────
+    msg = "[max tool rounds reached]"
+    bus.emit(Stop(reason="max_rounds", final_reply=msg))
+    return msg
+
+
+# ── Example extra listeners (opt-in) ─────────────────────────────────────────
+# Uncomment to log every tool call + result to a file.
+#
+# import datetime
+# LOG_FILE = "agent.log"
+#
+# @bus.on(PreToolUse)
+# def log_pre(event: PreToolUse):
+#     with open(LOG_FILE, "a") as f:
+#         f.write(f"[{datetime.datetime.now():%H:%M:%S}] PRE  {event.tool_name} {event.arguments}\n")
+#
+# @bus.on(PostToolUse)
+# def log_post(event: PostToolUse):
+#     with open(LOG_FILE, "a") as f:
+#         f.write(f"[{datetime.datetime.now():%H:%M:%S}] POST {event.tool_name} → {event.result[:120]}\n")
+#
+# @bus.on(Stop)
+# def log_stop(event: Stop):
+#     with open(LOG_FILE, "a") as f:
+#         f.write(f"[{datetime.datetime.now():%H:%M:%S}] STOP reason={event.reason}\n\n")
 
 
 # ── Main REPL ─────────────────────────────────────────────────────────────────
@@ -137,8 +192,11 @@ def main():
         print("  export OPENROUTER_API_KEY=sk-or-...")
         return
 
+    auto = os.environ.get("AGENT_AUTO_APPROVE") == "1"
+
     print(c("bold", f"\nOpenRouter Agent  •  model: {MODEL}"))
     print(c("dim",  f"Tools: {', '.join(t['function']['name'] for t in TOOL_DEFINITIONS)}"))
+    print(c("dim",  f"Approval: {'auto' if auto else 'interactive (set AGENT_AUTO_APPROVE=1 to skip)'}"))
     print(c("dim",  "Type 'exit' to quit.\n"))
 
     history: list[dict] = [{"role": "system", "content": SYSTEM}]
@@ -162,8 +220,7 @@ def main():
         reply = run_agent(history)
         print(reply)
 
-        # history already updated inside run_agent; just ensure final reply is stored
-        if history[-1].get("role") != "assistant" or history[-1].get("content") != reply:
+        if history[-1].get("role") != "assistant":
             history.append({"role": "assistant", "content": reply})
 
 
