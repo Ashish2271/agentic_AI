@@ -19,13 +19,17 @@ import json
 import os
 import urllib.request
 import urllib.error
+from dotenv import load_dotenv
 
 from tools  import TOOL_DEFINITIONS, execute_tool
 from events import bus, PreToolUse, PostToolUse, Stop
 
+
+load_dotenv()
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
-API_KEY = "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"
+API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL    = "openai/gpt-4o-mini"
 SYSTEM   = (
