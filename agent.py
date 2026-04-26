@@ -22,15 +22,16 @@ import os
 import urllib.request
 import urllib.error
 from dotenv import load_dotenv
-
+import argparse
 from tools   import TOOL_DEFINITIONS, execute_tool
 from events  import bus, PreToolUse, PostToolUse, Stop
 from history import Session
+from models import AVAILABLE_MODELS
 load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL    = "openai/gpt-4o-mini"
+MODEL = AVAILABLE_MODELS["gpt-4o-mini"]
 SYSTEM   = (
     "You are a helpful coding agent. "
     "Use the provided tools whenever you need to read/write files, "
@@ -194,7 +195,15 @@ def main():
         print(c("red", "Error: OPENROUTER_API_KEY is not set."))
         print("  export OPENROUTER_API_KEY=sk-or-...")
         return
-
+ # Argument parser for model selection
+    parser = argparse.ArgumentParser(description='Run the OpenRouter agent.')
+    parser.add_argument('--model', choices=AVAILABLE_MODELS.keys(), default='gpt-4o-mini',
+                        help='Choose the model to use.')
+    args = parser.parse_args()
+    
+    # Set the model based on the command-line argument
+    global MODEL
+    MODEL = AVAILABLE_MODELS[args.model]
     auto = os.environ.get("AGENT_AUTO_APPROVE") == "1"
 
     # ── Start session ─────────────────────────────────────────────────────
