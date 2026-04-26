@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-agent.py — OpenRouter agent with tool-calling loop + EventBus.
+agent.py — OpenRouter agent with tool-calling loop, EventBus, and session history.
 
-Events fired each turn
------------------------
-  PreToolUse   → before a tool runs  (handler may cancel it)
-  PostToolUse  → after  a tool runs  (carries the result)
-  Stop         → when the loop exits (reason + final reply)
+Folder layout written each run
+-------------------------------
+history/
+└── 2025-01-30_14-22-05_a3f2/
+    ├── messages.jsonl   ← every message appended live
+    └── session.json     ← summary written on exit
 
 Usage:
     export OPENROUTER_API_KEY=sk-or-...
     python agent.py
 
-Set AGENT_AUTO_APPROVE=1 to skip interactive approval prompts.
+Env flags:
+    AGENT_AUTO_APPROVE=1   skip interactive tool-approval prompts
 """
 
 import json
@@ -21,14 +23,11 @@ import urllib.request
 import urllib.error
 from dotenv import load_dotenv
 
-from tools  import TOOL_DEFINITIONS, execute_tool
-from events import bus, PreToolUse, PostToolUse, Stop
-
-
+from tools   import TOOL_DEFINITIONS, execute_tool
+from events  import bus, PreToolUse, PostToolUse, Stop
+from history import Session
 load_dotenv()
-
 # ── Config ────────────────────────────────────────────────────────────────────
-# API_KEY  = os.environ.get("OPENROUTER_API_KEY", "")
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL    = "openai/gpt-4o-mini"
@@ -83,15 +82,12 @@ def call_api(messages: list[dict]) -> dict:
 
 # ── Agent loop ────────────────────────────────────────────────────────────────
 
-def run_agent(history: list[dict]) -> str:
+def run_agent(history: list[dict], session: Session, stats: dict) -> str:
     """
     Agentic loop: call model → handle tool calls → repeat until stop.
+    All activity is recorded to `session` live.
 
-    Events emitted
-    --------------
-    PreToolUse   before each tool call  (cancellable)
-    PostToolUse  after  each tool call
-    Stop         when the loop exits
+    `stats` is a mutable dict with keys: turns, tool_calls
     """
 
     for _round in range(MAX_TOOL_ROUNDS):
@@ -102,6 +98,7 @@ def run_agent(history: list[dict]) -> str:
         except urllib.error.HTTPError as e:
             error_body = e.read().decode()
             error_msg  = f"[HTTP {e.code}] {error_body}"
+            session.write_event("Stop", {"reason": "error", "error": error_msg})
             bus.emit(Stop(reason="error", final_reply="", error=error_msg))
             return error_msg
 
@@ -114,10 +111,17 @@ def run_agent(history: list[dict]) -> str:
         # ── 2. No tool calls → natural stop ──────────────────────────────
         if reason == "stop" or not message.get("tool_calls"):
             final = message.get("content") or ""
+            session.write_assistant(final)
+            session.write_event("Stop", {"reason": "stop"})
             bus.emit(Stop(reason="stop", final_reply=final))
+            stats["turns"] += 1
             return final
 
         # ── 3. Process each tool call ─────────────────────────────────────
+        # Write the assistant's text part (if any) before tool calls
+        if message.get("content"):
+            session.write_assistant(message["content"])
+
         for tool_call in message["tool_calls"]:
             fn_name      = tool_call["function"]["name"]
             tool_call_id = tool_call["id"]
@@ -127,12 +131,20 @@ def run_agent(history: list[dict]) -> str:
             except json.JSONDecodeError:
                 args = {}
 
+            # Record the pending call
+            session.write_tool_call(fn_name, args, tool_call_id)
+
             # ── PreToolUse ────────────────────────────────────────────────
             pre = bus.emit(PreToolUse(
                 tool_name    = fn_name,
                 tool_call_id = tool_call_id,
                 arguments    = args,
             ))
+            session.write_event("PreToolUse", {
+                "tool_name":  fn_name,
+                "cancelled":  pre.cancelled,
+                "cancel_reason": pre.cancel_reason if pre.cancelled else None,
+            })
 
             if pre.cancelled:
                 result = f"[Cancelled] {pre.cancel_reason}"
@@ -143,6 +155,10 @@ def run_agent(history: list[dict]) -> str:
                 result = execute_tool(fn_name, args)
                 preview = result[:200] + ("…" if len(result) > 200 else "")
                 print(c("dim", f"     → {preview}"))
+                stats["tool_calls"] += 1
+
+            # Record the result
+            session.write_tool_result(fn_name, tool_call_id, result)
 
             # ── PostToolUse ───────────────────────────────────────────────
             bus.emit(PostToolUse(
@@ -151,8 +167,12 @@ def run_agent(history: list[dict]) -> str:
                 arguments    = args,
                 result       = result,
             ))
+            session.write_event("PostToolUse", {
+                "tool_name": fn_name,
+                "result_preview": result[:200],
+            })
 
-            # Feed result back into history for the next model call
+            # Feed result back into history
             history.append({
                 "role":         "tool",
                 "tool_call_id": tool_call_id,
@@ -162,30 +182,9 @@ def run_agent(history: list[dict]) -> str:
 
     # ── Hit round limit ───────────────────────────────────────────────────────
     msg = "[max tool rounds reached]"
+    session.write_event("Stop", {"reason": "max_rounds"})
     bus.emit(Stop(reason="max_rounds", final_reply=msg))
     return msg
-
-
-# ── Example extra listeners (opt-in) ─────────────────────────────────────────
-# Uncomment to log every tool call + result to a file.
-#
-# import datetime
-# LOG_FILE = "agent.log"
-#
-# @bus.on(PreToolUse)
-# def log_pre(event: PreToolUse):
-#     with open(LOG_FILE, "a") as f:
-#         f.write(f"[{datetime.datetime.now():%H:%M:%S}] PRE  {event.tool_name} {event.arguments}\n")
-#
-# @bus.on(PostToolUse)
-# def log_post(event: PostToolUse):
-#     with open(LOG_FILE, "a") as f:
-#         f.write(f"[{datetime.datetime.now():%H:%M:%S}] POST {event.tool_name} → {event.result[:120]}\n")
-#
-# @bus.on(Stop)
-# def log_stop(event: Stop):
-#     with open(LOG_FILE, "a") as f:
-#         f.write(f"[{datetime.datetime.now():%H:%M:%S}] STOP reason={event.reason}\n\n")
 
 
 # ── Main REPL ─────────────────────────────────────────────────────────────────
@@ -198,34 +197,49 @@ def main():
 
     auto = os.environ.get("AGENT_AUTO_APPROVE") == "1"
 
-    print(c("bold", f"\nOpenRouter Agent  •  model: {MODEL}"))
-    print(c("dim",  f"Tools: {', '.join(t['function']['name'] for t in TOOL_DEFINITIONS)}"))
-    print(c("dim",  f"Approval: {'auto' if auto else 'interactive (set AGENT_AUTO_APPROVE=1 to skip)'}"))
-    print(c("dim",  "Type 'exit' to quit.\n"))
+    # ── Start session ─────────────────────────────────────────────────────
+    session = Session.start(model=MODEL)
+
+    print(c("bold",  f"\nOpenRouter Agent  •  model: {MODEL}"))
+    print(c("dim",   f"Tools: {', '.join(t['function']['name'] for t in TOOL_DEFINITIONS)}"))
+    print(c("dim",   f"Approval: {'auto' if auto else 'interactive'}"))
+    print(c("purple" if hasattr(c, '__call__') else "dim",
+            f"Session: {session.session_id}  →  {session.path}"))
+    print(c("dim",   "Type 'exit' to quit.\n"))
 
     history: list[dict] = [{"role": "system", "content": SYSTEM}]
+    session.write_system(SYSTEM)
 
-    while True:
-        try:
-            user_input = input(c("cyan", "You: ")).strip()
-        except (EOFError, KeyboardInterrupt):
-            print(c("dim", "\nBye!"))
-            break
+    stats = {"turns": 0, "tool_calls": 0}
 
-        if not user_input:
-            continue
-        if user_input.lower() in {"exit", "quit", "q"}:
-            print(c("dim", "Bye!"))
-            break
+    try:
+        while True:
+            try:
+                user_input = input(c("cyan", "You: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print(c("dim", "\nBye!"))
+                break
 
-        history.append({"role": "user", "content": user_input})
+            if not user_input:
+                continue
+            if user_input.lower() in {"exit", "quit", "q"}:
+                print(c("dim", "Bye!"))
+                break
 
-        print(c("green", "Agent:"), end=" ", flush=True)
-        reply = run_agent(history)
-        print(reply)
+            session.write_user(user_input)
+            history.append({"role": "user", "content": user_input})
 
-        if history[-1].get("role") != "assistant":
-            history.append({"role": "assistant", "content": reply})
+            print(c("green", "Agent:"), end=" ", flush=True)
+            reply = run_agent(history, session, stats)
+            print(reply)
+
+            if history[-1].get("role") != "assistant":
+                history.append({"role": "assistant", "content": reply})
+
+    finally:
+        # Always write the summary, even if we crash or Ctrl-C
+        session.end(turns=stats["turns"], tool_calls=stats["tool_calls"])
+        print(c("dim", f"\nHistory saved → {session.path}"))
 
 
 if __name__ == "__main__":
