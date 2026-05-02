@@ -12,7 +12,6 @@ from typing import Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 API_KEY   = os.environ.get("OPENROUTER_API_KEY", "")
-API_KEY   = "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"
 BASE_URL  = "https://openrouter.ai/api/v1/chat/completions"
 MODEL     = "openai/gpt-4o-mini"          # change to any OpenRouter model
 SYSTEM    = "You are a helpful assistant."

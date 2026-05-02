@@ -1,0 +1,3 @@
+[console_scripts]
+agent = agent:main
+council = council:main
